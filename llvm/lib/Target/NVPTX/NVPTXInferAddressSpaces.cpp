@@ -105,6 +105,8 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include <queue>
+
 using namespace llvm;
 
 namespace {
@@ -415,9 +417,236 @@ static unsigned joinAddressSpaces(unsigned AS1, unsigned AS2) {
   return AS1 == AS2 ? AS1 : (unsigned)AddressSpace::ADDRESS_SPACE_GENERIC;
 }
 
+enum class Cost : unsigned {
+  GLOBAL = 1 << 0,
+  SHARED = 1 << 1,
+  CONST = 1 << 2,
+  LOCAL = 1 << 3,
+  PARAM = 1 << 4,
+
+  ZERO = (1 << 5) - 1,
+  INF = 0,
+};
+
+Cost Propagate(Cost Original, Cost Delta) {
+  return (Cost)((unsigned)Original & (unsigned)Delta);
+}
+
+bool Merge(Cost &Original, Cost Delta) {
+  Cost New = (Cost)((unsigned)Original | (unsigned)Delta);
+  bool Ret = Original != New;
+  Original = New;
+  return Ret;
+}
+
+static Cost AddrSpaceToCost(AddressSpace AddrSpace) {
+  switch (AddrSpace) {
+  case ADDRESS_SPACE_GENERIC:
+    return Cost::ZERO;
+  case ADDRESS_SPACE_GLOBAL:
+    return Cost::GLOBAL;
+  case ADDRESS_SPACE_SHARED:
+    return Cost::SHARED;
+  case ADDRESS_SPACE_CONST:
+    return Cost::CONST;
+  case ADDRESS_SPACE_LOCAL:
+    return Cost::LOCAL;
+  case ADDRESS_SPACE_PARAM:
+    return Cost::PARAM;
+  }
+}
+
+static Optional<AddressSpace> CostToSingleAddrSpace(Cost C) {
+  switch (C) {
+  default:
+    return Optional<AddressSpace>{};
+  case Cost::GLOBAL:
+    return ADDRESS_SPACE_GLOBAL;
+  case Cost::SHARED:
+    return ADDRESS_SPACE_SHARED;
+  case Cost::CONST:
+    return ADDRESS_SPACE_CONST;
+  case Cost::LOCAL:
+    return ADDRESS_SPACE_LOCAL;
+  case Cost::PARAM:
+    return ADDRESS_SPACE_PARAM;
+  case Cost::ZERO:
+    return ADDRESS_SPACE_GENERIC;
+  }
+}
+
+class Graph {
+  std::vector<std::pair<const Value *, std::vector<std::pair<int, Cost>>>>
+      Nodes;
+  std::map<const Value *, int> ValueMap;
+
+public:
+  int addNode(const Value *Node) {
+    if (ValueMap.count(Node)) {
+      return ValueMap[Node];
+    }
+    Nodes.emplace_back(Node, std::vector<std::pair<int, Cost>>{});
+    return ValueMap[Node] = Nodes.size() - 1;
+  }
+  // TODO: Duplicated edges
+  void addEdge(int Left, int Right, Cost Cost) {
+    Nodes[Left].second.emplace_back(Right, Cost);
+  }
+  int getNumNodes() const { return Nodes.size(); }
+  const Value *getNodeValue(int Index) const { return Nodes[Index].first; }
+  Optional<int> getNodeByValue(const Value *V) const {
+    if (ValueMap.count(V)) {
+      return ValueMap.at(V);
+    }
+    return Optional<int>{};
+  }
+  iterator_range<std::vector<std::pair<int, Cost>>::const_iterator>
+  getSuccessors(int Index) const {
+    return Nodes[Index].second;
+  }
+  void dump() const {
+    dbgs() << "Graph: \n";
+    dbgs() << "  Nodes:\n";
+    for (size_t i = 0; i < Nodes.size(); i++) {
+      dbgs() << "    " << i << ": ";
+      if (Nodes[i].first) {
+        Nodes[i].first->dump();
+      } else {
+        dbgs() << "Phony source\n";
+      }
+    }
+    dbgs() << "  Edges:\n";
+    for (size_t i = 0; i < Nodes.size(); i++) {
+      for (const auto &Tp : Nodes[i].second) {
+        int Right;
+        Cost C;
+        std::tie(Right, C) = Tp;
+        fprintf(stderr, "    %zu -> %d: 0x%x\n", i, Right, (unsigned)C);
+      }
+    }
+  }
+};
+
+static std::pair<Graph, int> buildGraph(const Function &F) {
+  Graph G;
+  int Source = G.addNode(nullptr);
+  // TODO: Support global variables.
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &Inst : BB) {
+      if (isa<PHINode>(Inst) || isa<AddrSpaceCastInst>(Inst) ||
+          isa<AllocaInst>(Inst) || isa<GetElementPtrInst>(Inst)) {
+        if (const auto *Pointer = dyn_cast<PointerType>(Inst.getType())) {
+          int Dest = G.addNode(&Inst);
+          for (const Use &U : Inst.operands()) {
+            G.addEdge(
+                G.addNode(U.get()), Dest,
+                AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+          }
+        }
+      }
+    }
+  }
+  for (int i = 0; i < G.getNumNodes(); i++) {
+    auto V = G.getNodeValue(i);
+    if (V && (isa<GlobalValue>(V) || isa<Argument>(V))) {
+      if (const auto *Pointer = dyn_cast<PointerType>(V->getType())) {
+        G.addEdge(Source, i,
+                  AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+      }
+    }
+  }
+  // G.dump();
+  return std::make_pair(G, Source);
+}
+
+struct ShortestPaths {
+  std::vector<Cost> Distances;
+
+  void dump() {
+    dbgs() << "Distances:\n";
+    for (size_t i = 0; i < Distances.size(); i++) {
+      fprintf(stderr, "  %zu: %x\n", i, (unsigned)Distances[i]);
+    }
+  }
+};
+
+static ShortestPaths runShortestPath(const Graph &G, int Source) {
+  ShortestPaths Paths;
+  Paths.Distances.assign(G.getNumNodes(), Cost::INF);
+  Paths.Distances[Source] = Cost::ZERO;
+  std::queue<int> Q;
+  std::vector<char> InQueue(G.getNumNodes());
+  const auto Push = [&](int Node) {
+    assert(!InQueue[Node]);
+    Q.push(Node);
+    InQueue[Node] = true;
+  };
+  const auto Pop = [&]() -> int {
+    assert(!Q.empty());
+    int Ret = Q.front();
+    InQueue[Ret] = false;
+    Q.pop();
+    return Ret;
+  };
+  Push(Source);
+  while (!Q.empty()) {
+    int Current = Pop();
+    for (const auto &Tp : G.getSuccessors(Current)) {
+      int To;
+      Cost C;
+      std::tie(To, C) = Tp;
+      if (Merge(Paths.Distances[To], Propagate(Paths.Distances[Current], C))) {
+        if (!InQueue[To]) {
+          Push(To);
+        }
+      }
+    }
+  }
+  // Paths.dump();
+  return Paths;
+}
+
+static bool rewrite(const Graph &G, const ShortestPaths &P, Function &F) {
+  bool Changed = false;
+
+  // TODO: add more instructions to rewrite.
+  for (size_t i = 0; i < P.Distances.size(); i++) {
+    if (auto AddrSpace = CostToSingleAddrSpace(P.Distances[i])) {
+      if (auto V = G.getNodeValue(i)) {
+        std::vector<Use *> Uses;
+        for (const Use &U : V->uses()) {
+          Uses.push_back(const_cast<Use *>(&U));
+        }
+        for (Use *U : Uses) {
+          if (auto *Load = dyn_cast<LoadInst>(U->getUser())) {
+            auto *Operand = Load->getPointerOperand();
+            U->set(IRBuilder<>(Load).CreateAddrSpaceCast(
+                Operand,
+                Operand->getType()->getPointerElementType()->getPointerTo(
+                    *AddrSpace)));
+            Changed = true;
+          } else if (auto *Store = dyn_cast<StoreInst>(U->getUser())) {
+            auto *Operand = Store->getPointerOperand();
+            U->set(IRBuilder<>(Store).CreateAddrSpaceCast(
+                Operand,
+                Operand->getType()->getPointerElementType()->getPointerTo(
+                    *AddrSpace)));
+            Changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  return Changed;
+}
+
 bool NVPTXInferAddressSpaces::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
+
+  auto Pr = buildGraph(F);
+  return rewrite(Pr.first, runShortestPath(Pr.first, Pr.second), F);
 
   // Collects all generic address expressions in postorder.
   std::vector<Value *> Postorder = collectGenericAddressExpressions(F);

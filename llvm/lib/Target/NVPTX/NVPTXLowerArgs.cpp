@@ -244,6 +244,7 @@ bool NVPTXLowerArgs::runOnDeviceFunction(Function &F) {
 }
 
 bool NVPTXLowerArgs::runOnFunction(Function &F) {
+  return false;
   return isKernelFunction(F) ? runOnKernelFunction(F) : runOnDeviceFunction(F);
 }
 
