@@ -115,13 +115,13 @@ const unsigned ADDRESS_SPACE_UNINITIALIZED = (unsigned)-1;
 using ValueToAddrSpaceMapTy = DenseMap<const Value *, unsigned>;
 
 /// \brief NVPTXInferAddressSpaces
-class NVPTXInferAddressSpaces: public FunctionPass {
+class NVPTXInferAddressSpaces : public ModulePass {
 public:
   static char ID;
 
-  NVPTXInferAddressSpaces() : FunctionPass(ID) {}
+  NVPTXInferAddressSpaces() : ModulePass(ID) {}
 
-  bool runOnFunction(Function &F) override;
+  bool runOnModule(Module &M) override;
 
 private:
   // Returns the new address space of V if updated; otherwise, returns None.
@@ -527,31 +527,78 @@ public:
   }
 };
 
-static std::pair<Graph, int> buildGraph(const Function &F) {
+static std::pair<Graph, int> buildGraph(const Module &M) {
   Graph G;
   int Source = G.addNode(nullptr);
-  // TODO: Support global variables.
-  for (const BasicBlock &BB : F) {
-    for (const Instruction &Inst : BB) {
-      if (isa<PHINode>(Inst) || isa<AddrSpaceCastInst>(Inst) ||
-          isa<AllocaInst>(Inst) || isa<GetElementPtrInst>(Inst)) {
-        if (const auto *Pointer = dyn_cast<PointerType>(Inst.getType())) {
+  for (const GlobalVariable &GV : M.getGlobalList()) {
+    const auto *Pointer = cast<PointerType>(GV.getType());
+    G.addEdge(Source, G.addNode(&GV),
+              AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+  }
+  for (const Function &F : M) {
+    for (const BasicBlock &BB : F) {
+      for (const Instruction &Inst : BB) {
+        // Nodes that create pointers
+        if (isa<AddrSpaceCastInst>(Inst) || isa<AllocaInst>(Inst)) {
+          if (const auto *Pointer = dyn_cast<PointerType>(Inst.getType())) {
+            int Dest = G.addNode(&Inst);
+            for (const Use &U : Inst.operands()) {
+              G.addEdge(
+                  G.addNode(U.get()), Dest,
+                  AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+            }
+          }
+          // Nodes that propagate other pointers
+        } else if (isa<PHINode>(Inst) || isa<GetElementPtrInst>(Inst)) {
           int Dest = G.addNode(&Inst);
           for (const Use &U : Inst.operands()) {
-            G.addEdge(
-                G.addNode(U.get()), Dest,
-                AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+            G.addEdge(G.addNode(U.get()), Dest, Cost::ZERO);
+          }
+          // IPO.
+          // For `call %ret = @f(%arg_a, %arg_b)`, where `define ret_type
+          // @f(%param_a, %param_b)`,
+          // Create edges:
+          //   %arg_a -> %param_a
+          //   %arg_b -> %param_b
+          //   @f -> %ret
+          // Thus @f is used as the `returned param`. It's hacky, should create
+          // a phony node for returned param.
+        } else if (const auto *Call = dyn_cast<CallInst>(&Inst)) {
+          const auto *Callee = Call->getCalledFunction();
+
+          auto ArgIt = Inst.op_begin();
+          auto ParamIt = Callee->arg_begin();
+          while (ArgIt != Inst.op_end() && ParamIt != Callee->arg_end()) {
+            G.addEdge(G.addNode(ArgIt->get()), G.addNode(&*ParamIt),
+                      Cost::ZERO);
+            ++ArgIt;
+            ++ParamIt;
+          }
+          G.addEdge(G.addNode(Callee), G.addNode(&Inst), Cost::ZERO);
+          // `ret %e` creates
+          //   %e -> @f
+        } else if (const auto *Return = dyn_cast<ReturnInst>(&Inst)) {
+          if (const auto *RV = Return->getReturnValue()) {
+            G.addEdge(G.addNode(RV), G.addNode(&F), Cost::ZERO);
           }
         }
       }
     }
-  }
-  for (int i = 0; i < G.getNumNodes(); i++) {
-    auto V = G.getNodeValue(i);
-    if (V && (isa<GlobalValue>(V) || isa<Argument>(V))) {
-      if (const auto *Pointer = dyn_cast<PointerType>(V->getType())) {
-        G.addEdge(Source, i,
-                  AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+    if (F.hasLocalLinkage()) {
+      // internal functions' parameters propagate other pointers.
+      for (const Argument &Arg : F.getArgumentList()) {
+        int ArgNode = G.addNode(&Arg);
+        for (const Value *V : Arg.users()) {
+          G.addEdge(ArgNode, G.addNode(V), Cost::ZERO);
+        }
+      }
+    } else {
+      // extern function parameters create pointers.
+      for (const Argument &Arg : F.getArgumentList()) {
+        if (const auto *Pointer = dyn_cast<PointerType>(Arg.getType())) {
+          G.addEdge(Source, G.addNode(&Arg),
+                    AddrSpaceToCost((AddressSpace)Pointer->getAddressSpace()));
+        }
       }
     }
   }
@@ -606,7 +653,7 @@ static ShortestPaths runShortestPath(const Graph &G, int Source) {
   return Paths;
 }
 
-static bool rewrite(const Graph &G, const ShortestPaths &P, Function &F) {
+static bool rewrite(const Graph &G, const ShortestPaths &P, Module &M) {
   bool Changed = false;
 
   // TODO: add more instructions to rewrite.
@@ -641,24 +688,24 @@ static bool rewrite(const Graph &G, const ShortestPaths &P, Function &F) {
   return Changed;
 }
 
-bool NVPTXInferAddressSpaces::runOnFunction(Function &F) {
-  if (skipFunction(F))
+bool NVPTXInferAddressSpaces::runOnModule(Module &M) {
+  if (skipModule(M))
     return false;
 
-  auto Pr = buildGraph(F);
-  return rewrite(Pr.first, runShortestPath(Pr.first, Pr.second), F);
-
-  // Collects all generic address expressions in postorder.
-  std::vector<Value *> Postorder = collectGenericAddressExpressions(F);
-
-  // Runs a data-flow analysis to refine the address spaces of every expression
-  // in Postorder.
-  ValueToAddrSpaceMapTy InferredAddrSpace;
-  inferAddressSpaces(Postorder, &InferredAddrSpace);
-
-  // Changes the address spaces of the generic address expressions who are
-  // inferred to point to a specific address space.
-  return rewriteWithNewAddressSpaces(Postorder, InferredAddrSpace, &F);
+  auto Pr = buildGraph(M);
+  return rewrite(Pr.first, runShortestPath(Pr.first, Pr.second), M);
+//
+//  // Collects all generic address expressions in postorder.
+//  std::vector<Value *> Postorder = collectGenericAddressExpressions(F);
+//
+//  // Runs a data-flow analysis to refine the address spaces of every expression
+//  // in Postorder.
+//  ValueToAddrSpaceMapTy InferredAddrSpace;
+//  inferAddressSpaces(Postorder, &InferredAddrSpace);
+//
+//  // Changes the address spaces of the generic address expressions who are
+//  // inferred to point to a specific address space.
+//  return rewriteWithNewAddressSpaces(Postorder, InferredAddrSpace, &F);
 }
 
 void NVPTXInferAddressSpaces::inferAddressSpaces(
@@ -807,6 +854,6 @@ bool NVPTXInferAddressSpaces::rewriteWithNewAddressSpaces(
   return true;
 }
 
-FunctionPass *llvm::createNVPTXInferAddressSpacesPass() {
+ModulePass *llvm::createNVPTXInferAddressSpacesPass() {
   return new NVPTXInferAddressSpaces();
 }

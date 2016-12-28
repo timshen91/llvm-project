@@ -85,3 +85,70 @@ bb4:
   %ret = load float, float* %ptr
   ret float %ret
 }
+
+define float @IPOSuccExternal(float addrspace(3)* %in) {
+  %ptr = addrspacecast float addrspace(3)* %in to float*
+  %ret = call float @IPOSucc(float* %ptr)
+  ret float %ret
+}
+
+; CHECK-LABEL: IPOSucc
+; CHECK: load float, float addrspace(3)*
+define internal float @IPOSucc(float* %ptr) {
+  %ret = load float, float* %ptr
+  ret float %ret
+}
+
+; CHECK-LABEL: IPOFail
+; CHECK: load float, float*
+define float @IPOFailExternal1(float addrspace(3)* %in) {
+  %ptr = addrspacecast float addrspace(3)* %in to float*
+  %ret = call float @IPOFail(float* %ptr)
+  ret float %ret
+}
+
+define float @IPOFailExternal2(float addrspace(1)* %in) {
+  %ptr = addrspacecast float addrspace(1)* %in to float*
+  %ret = call float @IPOFail(float* %ptr)
+  ret float %ret
+}
+
+define internal float @IPOFail(float* %ptr) {
+  %ret = load float, float* %ptr
+  ret float %ret
+}
+
+; CHECK-LABEL: IPOReturnValueSuccExternal
+; CHECK: load float, float addrspace(3)*
+define float @IPOReturnValueSuccExternal(float addrspace(3)* %in) {
+  %addr = addrspacecast float addrspace(3)* %in to float*
+  %ptr = call float* @IPOReturnValueSucc(float* %addr)
+  %ret = load float, float* %ptr
+  ret float %ret
+}
+
+define internal float* @IPOReturnValueSucc(float* %in) {
+  ret float* %in
+}
+
+; CHECK-LABEL: IPOReturnValueFailExternal1
+; CHECK: load float, float*
+define float @IPOReturnValueFailExternal1(float addrspace(3)* %in) {
+  %addr = addrspacecast float addrspace(3)* %in to float*
+  %ptr = call float* @IPOReturnValueFail(float* %addr)
+  %ret = load float, float* %ptr
+  ret float %ret
+}
+
+; CHECK-LABEL: IPOReturnValueFailExternal2
+; CHECK: load float, float*
+define float @IPOReturnValueFailExternal2(float addrspace(1)* %in) {
+  %addr = addrspacecast float addrspace(1)* %in to float*
+  %ptr = call float* @IPOReturnValueFail(float* %addr)
+  %ret = load float, float* %ptr
+  ret float %ret
+}
+
+define internal float* @IPOReturnValueFail(float* %in) {
+  ret float* %in
+}
