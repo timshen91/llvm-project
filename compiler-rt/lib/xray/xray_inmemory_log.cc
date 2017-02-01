@@ -26,7 +26,7 @@
 
 #if defined(__x86_64__)
 #include "xray_x86_64.h"
-#elif defined(__arm__) || defined(__aarch64__)
+#elif defined(__arm__) || defined(__aarch64__) || defined(__powerpc64__)
 #include "xray_emulate_tsc.h"
 #else
 #error "Unsupported CPU Architecture"
