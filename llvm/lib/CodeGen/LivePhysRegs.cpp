@@ -208,6 +208,22 @@ void llvm::computeLiveIns(LivePhysRegs &LiveRegs, const TargetRegisterInfo &TRI,
   for (MachineInstr &MI : make_range(MBB.rbegin(), MBB.rend()))
     LiveRegs.stepBackward(MI);
 
+  exportToBlockLiveIns(LiveRegs, TRI, MBB);
+}
+
+void llvm::computeLiveOuts(LivePhysRegs &LiveRegs,
+                           const TargetRegisterInfo &TRI,
+                           MachineBasicBlock &MBB) {
+  LiveRegs.init(TRI);
+  LiveRegs.addBlockLiveIns(MBB);
+  SmallVector<std::pair<unsigned, const MachineOperand *>, 16> Clobbers;
+  for (MachineInstr &MI : make_range(MBB.begin(), MBB.end()))
+    LiveRegs.stepForward(MI, Clobbers);
+}
+
+void llvm::exportToBlockLiveIns(const LivePhysRegs &LiveRegs,
+                                const TargetRegisterInfo &TRI,
+                                MachineBasicBlock &MBB) {
   for (unsigned Reg : LiveRegs) {
     // Skip the register if we are about to add one of its super registers.
     bool ContainsSuperReg = false;

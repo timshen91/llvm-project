@@ -144,7 +144,6 @@ public:
   /// \brief Dumps the currently live registers to the debug output.
   void dump() const;
 
-private:
   /// Adds live-in registers from basic block @p MBB, taking associated
   /// lane masks into consideration.
   void addBlockLiveIns(const MachineBasicBlock &MBB);
@@ -161,6 +160,13 @@ inline raw_ostream &operator<<(raw_ostream &OS, const LivePhysRegs& LR) {
 /// times in a pass.
 void computeLiveIns(LivePhysRegs &LiveRegs, const TargetRegisterInfo &TRI,
                     MachineBasicBlock &MBB);
+
+void computeLiveOuts(LivePhysRegs &LiveRegs, const TargetRegisterInfo &TRI,
+                     MachineBasicBlock &MBB);
+
+void exportToBlockLiveIns(const LivePhysRegs &LiveRegs,
+                          const TargetRegisterInfo &TRI,
+                          MachineBasicBlock &MBB);
 
 } // end namespace llvm
 

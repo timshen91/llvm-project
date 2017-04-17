@@ -347,11 +347,12 @@ static unsigned ComputeCommonTailLength(MachineBasicBlock *MBB1,
 
 void BranchFolder::ReplaceTailWithBranchTo(MachineBasicBlock::iterator OldInst,
                                            MachineBasicBlock *NewDest) {
+  MachineBasicBlock *CurMBB = OldInst->getParent();
   TII->ReplaceTailWithBranchTo(OldInst, NewDest);
 
   if (UpdateLiveIns) {
-    NewDest->clearLiveIns();
-    computeLiveIns(LiveRegs, *TRI, *NewDest);
+    computeLiveOuts(LiveRegs, *TRI, *CurMBB);
+    exportToBlockLiveIns(LiveRegs, *TRI, *NewDest);
   }
 
   ++NumTailMerge;
@@ -387,8 +388,10 @@ MachineBasicBlock *BranchFolder::SplitMBBAt(MachineBasicBlock &CurMBB,
   // NewMBB inherits CurMBB's block frequency.
   MBBFreqInfo.setBlockFreq(NewMBB, MBBFreqInfo.getBlockFreq(&CurMBB));
 
-  if (UpdateLiveIns)
-    computeLiveIns(LiveRegs, *TRI, *NewMBB);
+  if (UpdateLiveIns) {
+    computeLiveOuts(LiveRegs, *TRI, CurMBB);
+    exportToBlockLiveIns(LiveRegs, *TRI, *NewMBB);
+  }
 
   // Add the new block to the funclet.
   const auto &FuncletI = FuncletMembership.find(&CurMBB);
@@ -954,6 +957,7 @@ bool BranchFolder::TryTailMergeBlocks(MachineBasicBlock *SuccBB,
       // BB i is no longer a predecessor of SuccBB; remove it from the worklist.
       MergePotentials.erase(SameTails[i].getMPIter());
     }
+    MBB->sortUniqueLiveIns();
     DEBUG(dbgs() << "\n");
     // We leave commonTailIndex in the worklist in case there are other blocks
     // that match it with a smaller number of instructions.
