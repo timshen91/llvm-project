@@ -166,8 +166,7 @@ void AggressiveAntiDepBreaker::StartBlock(MachineBasicBlock *BB) {
   for (const MCPhysReg *I = MF.getRegInfo().getCalleeSavedRegs(); *I;
        ++I) {
     unsigned Reg = *I;
-    if (!IsReturnBlock && !(Pristine.test(Reg) || BB->isLiveIn(Reg)))
-      continue;
+    if (!IsReturnBlock && !Pristine.test(Reg)) continue;
     for (MCRegAliasIterator AI(Reg, TRI, true); AI.isValid(); ++AI) {
       unsigned AliasReg = *AI;
       State->UnionGroups(AliasReg, 0);

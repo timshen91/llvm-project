@@ -73,9 +73,7 @@ void CriticalAntiDepBreaker::StartBlock(MachineBasicBlock *BB) {
   BitVector Pristine = MFI.getPristineRegs(MF);
   for (const MCPhysReg *I = MF.getRegInfo().getCalleeSavedRegs(); *I;
        ++I) {
-    unsigned Reg = *I;
-    if (!IsReturnBlock && !(Pristine.test(Reg) || BB->isLiveIn(Reg)))
-      continue;
+    if (!IsReturnBlock && !Pristine.test(*I)) continue;
     for (MCRegAliasIterator AI(*I, TRI, true); AI.isValid(); ++AI) {
       unsigned Reg = *AI;
       Classes[Reg] = reinterpret_cast<TargetRegisterClass *>(-1);

@@ -4615,9 +4615,6 @@ bool LLParser::parseConstantValue(Type *Ty, Constant *&C) {
     C = cast<Constant>(V);
     return false;
   }
-  case ValID::t_Null:
-    C = Constant::getNullValue(Ty);
-    return false;
   default:
     return Error(Loc, "expected a constant value");
   }
